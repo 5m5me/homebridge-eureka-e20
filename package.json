@@ -1,0 +1,11 @@
+{
+  "name": "homebridge-eureka-e20",
+  "displayName": "Eureka E20 Plus",
+  "version": "0.1.0",
+  "description": "Eureka E20 Plus robot vacuum for Homebridge via the Eureka cloud",
+  "main": "index.js",
+  "license": "MIT",
+  "keywords": ["homebridge-plugin"],
+  "engines": { "homebridge": "^2.0.0", "node": ">=22" },
+  "scripts": { "test": "node --test" }
+}
