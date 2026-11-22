@@ -6,6 +6,8 @@ const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
 const { EurekaPlatform } = require('../lib/platform');
+const { AuthError } = require('../lib/cloud');
+const { CommandUnconfirmedError } = require('../lib/robot');
 
 // ---- Hand-written fake of the parts of the Homebridge API the platform uses ----
 class HapStatusError extends Error {
@@ -14,7 +16,11 @@ class HapStatusError extends Error {
 const HAPStatus = { SERVICE_COMMUNICATION_FAILURE: -70402 };
 const names = ['Manufacturer', 'Model', 'SerialNumber', 'On', 'BatteryLevel', 'ChargingState',
   'StatusLowBattery', 'ContactSensorState'];
-const Characteristic = { ChargingState: { NOT_CHARGING: 0, CHARGING: 1 } };
+const Characteristic = {
+  ChargingState: { NOT_CHARGING: 0, CHARGING: 1 },
+  StatusLowBattery: { BATTERY_LEVEL_NORMAL: 0, BATTERY_LEVEL_LOW: 1 },
+  ContactSensorState: { CONTACT_DETECTED: 0, CONTACT_NOT_DETECTED: 1 },
+};
 for (const n of names) if (!Characteristic[n]) Characteristic[n] = { name: n };
 else Characteristic[n].name = n;
 const Service = {};
@@ -76,11 +82,11 @@ function makeRobot() {
 const DEVICE = { deviceId: 'dev1', nickname: 'Vac', product: { sn8: '750Y000G' } };
 
 // Builds a platform, runs setup, returns handles. Always call h.stop().
-async function boot({ config, devices = [DEVICE], robot = makeRobot(), cached = [], waitMs = 50 } = {}) {
+async function boot({ config, devices = [DEVICE], robot = makeRobot(), cached = [], waitMs = 50, cloud, extra = {} } = {}) {
   const api = makeApi();
   const log = makeLog();
-  const cloud = { getDevices: async () => devices };
-  const deps = { makeCloud: () => cloud, makeRobot: () => robot, commandWaitMs: waitMs };
+  cloud = cloud || { getDevices: async () => devices };
+  const deps = { makeCloud: () => cloud, makeRobot: () => robot, commandWaitMs: waitMs, retryMs: 5, ...extra };
   const p = new EurekaPlatform(log, config || { email: 'a@b.c', password: 'pw' }, api, deps);
   for (const a of cached) p.configureAccessory(a);
   api.emit('didFinishLaunching');
@@ -178,6 +184,7 @@ test('switch handlers call the matching robot command', async () => {
   await h.svc('clean').getCharacteristic(On).set(true);
   await h.svc('clean').getCharacteristic(On).set(false);
   await h.svc('pause').getCharacteristic(On).set(true);
+  h.robot.state = { status: 'paused', battery: 80, fault: false, at: 1 };
   await h.svc('pause').getCharacteristic(On).set(false);
   assert.deepEqual(h.robot.calls, ['start', 'dock', 'pause', 'start']);
   h.stop();
@@ -190,7 +197,7 @@ test('a command that fails quickly makes the set handler throw and pushes state'
   const before = clean.updates.length;
   await assert.rejects(clean.getCharacteristic(Characteristic.On).set(true),
     (e) => e instanceof HapStatusError && e.hapStatus === HAPStatus.SERVICE_COMMUNICATION_FAILURE);
-  assert.ok(h.log.warns.some((m) => m.includes('not confirmed')));
+  assert.equal(h.log.warns.filter((m) => m.includes('not confirmed')).length, 1);
   assert.ok(clean.updates.length > before, 'state was pushed so the switch reverts');
   h.stop();
 });
@@ -210,7 +217,7 @@ test('a slow command returns after the wait; a later failure warns and pushes wi
     assert.equal(clean.updates.length, before);
     fail(new Error('late failure'));
     await tick(30);
-    assert.ok(h.log.warns.some((m) => m.includes('late failure')));
+    assert.equal(h.log.warns.filter((m) => m.includes('late failure')).length, 1);
     assert.ok(clean.updates.length > before);
     await tick(10);
     assert.deepEqual(rejections, []);
@@ -251,4 +258,162 @@ test('the polling loop runs and stops on shutdown', async () => {
   assert.equal(h.p.timer, null);
   await tick(5);
   assert.equal(h.robot.polls, 1);
+});
+
+test('an unconfirmed command is not logged again by the platform', async () => {
+  const h = await boot();
+  h.robot.dock = async () => { throw new CommandUnconfirmedError('the robot did not confirm'); };
+  await assert.rejects(h.svc('clean').getCharacteristic(Characteristic.On).set(false), HapStatusError);
+  assert.equal(h.log.warns.length, 0);
+  h.stop();
+});
+
+test('Pause off resumes only when the robot is paused', async () => {
+  const h = await boot();
+  const set = h.svc('pause').getCharacteristic(Characteristic.On).set;
+  for (const status of ['docked', 'cleaning', 'returning']) {
+    h.robot.state = { status, battery: 80, fault: false, at: 1 };
+    await set(false);
+  }
+  assert.deepEqual(h.robot.calls, []);
+  h.robot.state = { status: 'paused', battery: 80, fault: false, at: 1 };
+  await set(false);
+  assert.deepEqual(h.robot.calls, ['start']);
+  h.robot.calls.length = 0;
+  h.robot.fresh = false;
+  await set(false);
+  assert.deepEqual(h.robot.calls, []);
+  h.stop();
+});
+
+test('setup retries after a cloud failure and stops retrying once it works', async () => {
+  let n = 0;
+  const cloud = { getDevices: async () => { if (++n < 3) throw new Error('network down'); return [DEVICE]; } };
+  const h = await boot({ cloud });
+  assert.equal(h.api.registered.length, 0);
+  await tick(60);
+  assert.equal(n, 3);
+  assert.equal(h.api.registered.length, 1);
+  assert.equal(h.log.warns.filter((m) => m.includes('Setup failed')).length, 2);
+  assert.equal(h.p.retryTimer, null);
+  h.stop();
+});
+
+test('a pending setup retry is cleared on shutdown', async () => {
+  let n = 0;
+  const cloud = { getDevices: async () => { n++; throw new Error('down'); } };
+  const h = await boot({ cloud, extra: { retryMs: 20 } });
+  h.stop();
+  await tick(50);
+  assert.equal(n, 1);
+});
+
+test('an AuthError at setup logs an error and does not retry', async () => {
+  let n = 0;
+  const cloud = { getDevices: async () => { n++; throw new AuthError('Wrong email or password'); } };
+  const h = await boot({ cloud });
+  await tick(30);
+  assert.equal(n, 1);
+  assert.equal(h.log.errors.length, 1);
+  assert.match(h.log.errors[0], /email and password/);
+  assert.equal(h.p.retryTimer, null);
+  h.stop();
+});
+
+test('a cached accessory reads and sets as communication failure before setup completes', async () => {
+  const acc = new FakeAccessory('Vac', 'uuid:eureka-e20:dev1');
+  acc.addService(Service.Switch, 'c', 'clean');
+  acc.addService(Service.Switch, 'p', 'pause');
+  acc.addService(Service.Battery, 'b', 'battery');
+  acc.addService(Service.ContactSensor, 'f', 'fault');
+  const cloud = { getDevices: async () => { throw new Error('down'); } };
+  const h = await boot({ cloud, cached: [acc], extra: { retryMs: 100000 } });
+  const isFail = (e) => e instanceof HapStatusError && e.hapStatus === HAPStatus.SERVICE_COMMUNICATION_FAILURE;
+  const { On, BatteryLevel, ChargingState, StatusLowBattery, ContactSensorState } = Characteristic;
+  const sv = (t, sub) => acc.getServiceById(t, sub);
+  for (const [t, sub, c] of [[Service.Switch, 'clean', On], [Service.Switch, 'pause', On],
+    [Service.Battery, 'battery', BatteryLevel], [Service.Battery, 'battery', ChargingState],
+    [Service.Battery, 'battery', StatusLowBattery], [Service.ContactSensor, 'fault', ContactSensorState]]) {
+    assert.throws(() => sv(t, sub).getCharacteristic(c).get(), isFail);
+  }
+  for (const sub of ['clean', 'pause']) {
+    await assert.rejects(sv(Service.Switch, sub).getCharacteristic(On).set(true), isFail);
+    await assert.rejects(sv(Service.Switch, sub).getCharacteristic(On).set(false), isFail);
+  }
+  h.stop();
+});
+
+test('stale push also reports No Response on battery and fault', async () => {
+  const h = await boot();
+  h.robot.fresh = false;
+  h.robot.emit('state', h.robot.state);
+  for (const sub of ['battery', 'fault']) {
+    const last = h.svc(sub).updates.at(-1);
+    assert.ok(last[1] instanceof HapStatusError, sub);
+  }
+  h.stop();
+});
+
+test('the configured name wins; the nickname is the fallback', async () => {
+  let h = await boot({ config: { email: 'a', password: 'b', name: 'Mine' } });
+  assert.equal(h.acc.displayName, 'Mine');
+  h.stop();
+  h = await boot({ config: { email: 'a', password: 'b' } });
+  assert.equal(h.acc.displayName, 'Vac');
+  h.stop();
+});
+
+test('after a command the next poll is within 10 seconds and stays fast for two minutes', async () => {
+  const timers = [];
+  let clock = 1000000;
+  const extra = {
+    now: () => clock,
+    setTimeout: (fn, ms) => { const t = { fn, ms, cleared: false, unref() {} }; timers.push(t); return t; },
+    clearTimeout: (t) => { t.cleared = true; },
+  };
+  const h = await boot({ extra });
+  const live = () => timers.filter((t) => !t.cleared);
+  assert.equal(live().length, 1);
+  assert.equal(live()[0].ms, 30000);
+
+  await h.svc('clean').getCharacteristic(Characteristic.On).set(true);
+  assert.equal(live().length, 1);
+  assert.equal(live()[0].ms, 10000);
+
+  // Fire the poll; while inside two minutes it stays at 10 s.
+  clock += 10000;
+  let t = live()[0]; t.cleared = true; t.fn(); await tick(2);
+  assert.equal(live().at(-1).ms, 10000);
+  // Past two minutes it returns to the normal interval.
+  clock += 130000;
+  t = live().at(-1); t.cleared = true; t.fn(); await tick(2);
+  assert.equal(live().at(-1).ms, 30000);
+  h.stop();
+});
+
+test('no log call contains the password or a token', async () => {
+  const secretPw = 'S3cretPassw0rd';
+  const secretTok = 'TOKEN-ABC-123';
+  let n = 0;
+  let opts;
+  const cloud = { getDevices: async () => { if (++n === 1) throw new Error('network down'); return [DEVICE]; } };
+  const api = makeApi();
+  const log = makeLog();
+  const robot = makeRobot();
+  const p = new EurekaPlatform(log, { email: 'a@b.c', password: secretPw }, api,
+    { makeCloud: (o) => { opts = o; return cloud; }, makeRobot: () => robot, commandWaitMs: 20, retryMs: 5 });
+  api.emit('didFinishLaunching');
+  await p.ready;
+  await tick(30);
+  opts.onTokens({ accessToken: secretTok, refreshToken: secretTok, region: 'eu' });
+  robot.start = async () => { throw new Error('boom'); };
+  const clean = p.clean;
+  await assert.rejects(clean.getCharacteristic(Characteristic.On).set(true));
+  await tick(5);
+  const file = path.join(api.user.storagePath(), 'eureka-e20-tokens.json');
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  const all = [...log.warns, ...log.errors, ...log.debugs].join('\n');
+  assert.ok(!all.includes(secretPw));
+  assert.ok(!all.includes(secretTok));
+  api.emit('shutdown');
 });
