@@ -1,0 +1,14 @@
+{
+  "pluginAlias": "EurekaE20",
+  "pluginType": "platform",
+  "singular": true,
+  "schema": {
+    "type": "object",
+    "properties": {
+      "name": { "title": "Name", "type": "string", "default": "Eureka E20 Plus", "required": true },
+      "email": { "title": "Eureka app email", "type": "string", "format": "email", "required": true },
+      "password": { "title": "Eureka app password", "type": "string", "required": true, "x-schema-form": { "type": "password" } },
+      "pollSeconds": { "title": "Status check interval (seconds)", "type": "integer", "default": 30, "minimum": 15, "maximum": 300 }
+    }
+  }
+}
