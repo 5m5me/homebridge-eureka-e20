@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const p = require('../lib/protocol');
 
-// Real reply captured from Ned's robot on 2026-11-22: docked, suction 3, water 0, no fault.
+// Reply captured from a real E20 Plus: docked, suction 3, water 0, no fault.
 const REPLY = 'aa39b800000000000103320106000000000300000f005f000100000101000101010000010000020100071e000000000000000000011900000018';
 
 test('command frames match known-good hex', () => {

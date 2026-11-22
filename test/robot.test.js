@@ -156,29 +156,29 @@ test('pause confirms by polling and records the paused state', async () => {
 });
 
 test('dock sends its frame then re-polls', async () => {
-  const { cloud, robot } = make(['ack', withStatus(1)]);
+  const { cloud, robot } = make([withStatus(2), 'ack', withStatus(1)]);
   await robot.dock();
-  assert.deepStrictEqual(cloud.sent, [p.FRAMES.dock, p.FRAMES.queryStatus]);
+  assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus, p.FRAMES.dock, p.FRAMES.queryStatus]);
   assert.strictEqual(robot.state.status, 'returning');
 });
 
 test('a null reply to dock followed by a poll showing returning succeeds', async () => {
-  const { sleep, robot } = make([null, withStatus(1)]);
+  const { sleep, robot } = make([withStatus(2), null, withStatus(1)]);
   const s = await robot.dock();
   assert.strictEqual(s.status, 'returning');
   assert.deepStrictEqual(sleep.calls, []);
 });
 
 test('confirmation succeeds on the second poll after one wait', async () => {
-  const { cloud, sleep, robot } = make([null, withStatus(2), withStatus(1)]);
+  const { cloud, sleep, robot } = make([withStatus(2), null, withStatus(2), withStatus(1)]);
   const s = await robot.dock();
   assert.strictEqual(s.status, 'returning');
   assert.deepStrictEqual(sleep.calls, [2000]);
-  assert.strictEqual(cloud.sent.length, 3);
+  assert.strictEqual(cloud.sent.length, 4);
 });
 
 test('a null reply to dock with 4 polls still cleaning throws CommandUnconfirmedError', async () => {
-  const { cloud, sleep, robot } = make([null, withStatus(2), withStatus(2), withStatus(2), withStatus(2)]);
+  const { cloud, sleep, robot } = make([withStatus(2), null, withStatus(2), withStatus(2), withStatus(2), withStatus(2)]);
   await assert.rejects(robot.dock(), (err) => {
     assert.ok(err instanceof CommandUnconfirmedError);
     assert.match(err.message, /did not confirm/);
@@ -186,12 +186,12 @@ test('a null reply to dock with 4 polls still cleaning throws CommandUnconfirmed
     return true;
   });
   assert.deepStrictEqual(sleep.calls, [2000, 2000, 2000]);
-  assert.strictEqual(cloud.sent.length, 5);
+  assert.strictEqual(cloud.sent.length, 6);
 });
 
 test('command accepted but every confirmation poll throws gives CommandUnconfirmedError', async () => {
   const cause = new Error('down');
-  const { sleep, robot } = make(['ack', cause, cause, cause, cause]);
+  const { sleep, robot } = make([withStatus(2), 'ack', cause, cause, cause, cause]);
   await assert.rejects(robot.dock(), (err) => {
     assert.ok(err instanceof CommandUnconfirmedError);
     assert.match(err.message, /status is unknown/);
@@ -208,20 +208,20 @@ test('a control command reply is not proof either way', async () => {
 });
 
 test('a command the robot does not acknowledge fails unchanged', async () => {
-  const { cloud, robot } = make([new Error('The robot did not answer')]);
+  const { cloud, robot } = make([withStatus(2), new Error('The robot did not answer')]);
   await assert.rejects(robot.dock(), (err) => {
     assert.ok(!(err instanceof CommandUnconfirmedError));
     assert.match(err.message, /did not answer/);
     return true;
   });
-  assert.strictEqual(cloud.sent.length, 1);
+  assert.strictEqual(cloud.sent.length, 2);
 });
 
 test('concurrent poll and dock do not interleave their cloud calls', async () => {
-  const { cloud, robot } = make([DOCKED, 'ack', withStatus(1)]);
+  const { cloud, robot } = make([DOCKED, withStatus(2), 'ack', withStatus(1)]);
   await Promise.all([robot.poll(), robot.dock()]);
   assert.strictEqual(cloud.maxInflight, 1);
-  assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus, p.FRAMES.dock, p.FRAMES.queryStatus]);
+  assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus, p.FRAMES.queryStatus, p.FRAMES.dock, p.FRAMES.queryStatus]);
 });
 
 test('a failed operation does not block the next one', async () => {
@@ -236,8 +236,52 @@ test('a failed operation does not block the next one', async () => {
 test('commands log one debug line per command and one warning per unconfirmed command', async () => {
   const debug = []; const warn = [];
   const log = { debug: (m) => debug.push(m), warn: (m) => warn.push(m) };
-  const { robot } = make(['ack', withStatus(2), withStatus(2), withStatus(2), withStatus(2)], { log });
+  const { robot } = make([withStatus(2), 'ack', withStatus(2), withStatus(2), withStatus(2), withStatus(2)], { log });
   await assert.rejects(robot.dock(), CommandUnconfirmedError);
   assert.strictEqual(debug.length, 1);
   assert.strictEqual(warn.length, 1);
+});
+
+test('start when already cleaning or moving sends nothing', async () => {
+  for (const ws of [2, 14]) {
+    const { cloud, robot } = make([withStatus(ws)]);
+    const s = await robot.start();
+    assert.strictEqual(s.status, ws === 2 ? 'cleaning' : 'moving');
+    assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus]);
+  }
+});
+
+test('dock when already docked or returning sends nothing', async () => {
+  for (const ws of [4, 1]) {
+    const { cloud, robot } = make([withStatus(ws)]);
+    const s = await robot.dock();
+    assert.strictEqual(s.status, ws === 4 ? 'docked' : 'returning');
+    assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus]);
+  }
+});
+
+test('dock polls fresh status first and sends dock when cleaning', async () => {
+  const { cloud, robot } = make([withStatus(2), 'ack', withStatus(1)]);
+  await robot.dock();
+  assert.strictEqual(cloud.sent[1], p.FRAMES.dock);
+});
+
+test('resume when paused sends the resume frame and confirms', async () => {
+  const { cloud, robot } = make([withStatus(8), 'ack', withStatus(2)]);
+  const s = await robot.resume();
+  assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus, p.FRAMES.resume, p.FRAMES.queryStatus]);
+  assert.strictEqual(s.status, 'cleaning');
+});
+
+test('resume when docked, cleaning or idle sends no control frame', async () => {
+  for (const ws of [4, 2, 3]) {
+    const { cloud, robot } = make([withStatus(ws)]);
+    await robot.resume();
+    assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus]);
+  }
+});
+
+test('resume that is not confirmed throws CommandUnconfirmedError', async () => {
+  const { robot } = make([withStatus(8), 'ack', withStatus(8), withStatus(8), withStatus(8), withStatus(8)]);
+  await assert.rejects(robot.resume(), CommandUnconfirmedError);
 });

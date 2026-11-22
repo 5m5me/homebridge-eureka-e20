@@ -141,29 +141,137 @@ test('a failed login keeps the existing tokens', async () => {
   assert.strictEqual(f.calls[0].opts.headers.Authorization, undefined);
 });
 
+const MIN = 60 * 1000;
+function clientAt(f, clock) {
+  return new CloudClient({ email: 'e', password: 'p', fetchImpl: f, now: () => clock.t });
+}
+const BAD = ['/auth/login', 200, { errorCode: '0051002', msg: 'wrong' }];
+
 test('after an AuthError, login is refused without network for 15 minutes, then retried', async () => {
-  let t = 1000000;
-  const f = fakeFetch([['/auth/login', 200, { errorCode: '0051002', msg: 'wrong' }]]);
-  const c = new CloudClient({ email: 'e', password: 'p', fetchImpl: f, now: () => t });
+  const clock = { t: 1000000 };
+  const f = fakeFetch([BAD]);
+  const c = clientAt(f, clock);
   let first;
   await assert.rejects(c.login(), (err) => { first = err; return err instanceof AuthError; });
   assert.strictEqual(f.calls.length, 1);
 
-  t += 14 * 60 * 1000;
+  clock.t += 14 * MIN;
   await assert.rejects(c.login(), (err) => err === first);
   assert.strictEqual(f.calls.length, 1);
 
-  t += 2 * 60 * 1000;
+  clock.t += 2 * MIN;
   await assert.rejects(c.login(), AuthError);
   assert.strictEqual(f.calls.length, 2);
 });
 
-test('a CloudError at login is not remembered', async () => {
+test('auth cooldown doubles: 15 minutes, then 30', async () => {
+  const clock = { t: 0 };
+  const f = fakeFetch([BAD]);
+  const c = clientAt(f, clock);
+  await assert.rejects(c.login(), AuthError);
+  clock.t += 15 * MIN;
+  await assert.rejects(c.login(), AuthError);
+  assert.strictEqual(f.calls.length, 2);
+  clock.t += 29 * MIN;
+  await assert.rejects(c.login(), AuthError);
+  assert.strictEqual(f.calls.length, 2);
+  clock.t += 1 * MIN;
+  await assert.rejects(c.login(), AuthError);
+  assert.strictEqual(f.calls.length, 3);
+});
+
+test('after 3 consecutive AuthErrors login is disabled for good with no network call', async () => {
+  const clock = { t: 0 };
+  const f = fakeFetch([BAD]);
+  const c = clientAt(f, clock);
+  await assert.rejects(c.login(), AuthError);
+  clock.t += 15 * MIN;
+  await assert.rejects(c.login(), AuthError);
+  clock.t += 30 * MIN;
+  await assert.rejects(c.login(), (err) => err instanceof AuthError && /email and password/.test(err.message)
+    && /restart/i.test(err.message));
+  assert.strictEqual(f.calls.length, 3);
+  clock.t += 1000 * MIN;
+  await assert.rejects(c.login(), (err) => err instanceof AuthError && /plugin settings/.test(err.message));
+  assert.strictEqual(f.calls.length, 3);
+});
+
+test('a successful login resets the auth failure count', async () => {
+  const clock = { t: 0 };
+  let n = 0;
+  const f = fakeFetch([['/auth/login', 200, () => (++n === 3 ? [200, OK_LOGIN] : [200, { errorCode: '0051002' }])]]);
+  const c = clientAt(f, clock);
+  await assert.rejects(c.login(), AuthError);
+  clock.t += 15 * MIN;
+  await assert.rejects(c.login(), AuthError);
+  clock.t += 30 * MIN;
+  await c.login();
+  assert.strictEqual(c._authFailures, 0);
+  assert.strictEqual(c._failure, null);
+});
+
+test('a non-auth failure with an HTTP answer starts a 1 minute cooldown that doubles to a 60 minute cap', async () => {
+  const clock = { t: 0 };
   const f = fakeFetch([['/auth/login', 503, '<html></html>']]);
-  const c = new CloudClient({ email: 'e', password: 'p', fetchImpl: f });
-  await assert.rejects(c.login(), isCloudNotAuth);
+  const c = clientAt(f, clock);
+  let first;
+  await assert.rejects(c.login(), (err) => { first = err; return isCloudNotAuth(err); });
+  assert.strictEqual(f.calls.length, 1);
+  clock.t += 59 * 1000;
+  await assert.rejects(c.login(), (err) => err === first);
+  assert.strictEqual(f.calls.length, 1);
+  clock.t += 1000;
   await assert.rejects(c.login(), isCloudNotAuth);
   assert.strictEqual(f.calls.length, 2);
+  // second wait is 2 minutes
+  clock.t += 119 * 1000;
+  await assert.rejects(c.login(), isCloudNotAuth);
+  assert.strictEqual(f.calls.length, 2);
+  clock.t += 1000;
+  await assert.rejects(c.login(), isCloudNotAuth);
+  assert.strictEqual(f.calls.length, 3);
+  // keep failing until the cap: waits 4, 8, 16, 32, 60, 60
+  let calls = 3;
+  for (const wait of [4, 8, 16, 32, 60, 60]) {
+    clock.t += wait * MIN - 1;
+    await assert.rejects(c.login(), isCloudNotAuth);
+    assert.strictEqual(f.calls.length, calls);
+    clock.t += 1;
+    await assert.rejects(c.login(), isCloudNotAuth);
+    assert.strictEqual(f.calls.length, ++calls);
+  }
+});
+
+test('429 and a bad body also start a cooldown', async () => {
+  for (const route of [['/auth/login', 429, { msg: 'slow down' }], ['/auth/login', 200, '']]) {
+    const clock = { t: 0 };
+    const f = fakeFetch([route]);
+    const c = clientAt(f, clock);
+    await assert.rejects(c.login(), isCloudNotAuth);
+    await assert.rejects(c.login(), isCloudNotAuth);
+    assert.strictEqual(f.calls.length, 1);
+  }
+});
+
+test('a network-level failure with no HTTP answer starts no cooldown', async () => {
+  const f = fakeFetch([['/auth/login', 'throw', null]]);
+  const c = new CloudClient({ email: 'e', password: 'p', fetchImpl: f, now: () => 0 });
+  await assert.rejects(c.login(), isCloudNotAuth);
+  const n = f.calls.length;
+  await assert.rejects(c.login(), isCloudNotAuth);
+  assert.strictEqual(f.calls.length, 2 * n);
+});
+
+test('a successful login clears a non-auth cooldown and the backoff', async () => {
+  const clock = { t: 0 };
+  let n = 0;
+  const f = fakeFetch([['/auth/login', 200, () => (++n === 1 ? [503, 'x'] : [200, OK_LOGIN])]]);
+  const c = clientAt(f, clock);
+  await assert.rejects(c.login(), isCloudNotAuth);
+  clock.t += MIN;
+  await c.login();
+  assert.strictEqual(c._failures, 0);
+  assert.strictEqual(c._failure, null);
 });
 
 test('two concurrent calls with no tokens cause exactly one login request', async () => {

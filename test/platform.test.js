@@ -15,7 +15,7 @@ class HapStatusError extends Error {
 }
 const HAPStatus = { SERVICE_COMMUNICATION_FAILURE: -70402 };
 const names = ['Manufacturer', 'Model', 'SerialNumber', 'On', 'BatteryLevel', 'ChargingState',
-  'StatusLowBattery', 'ContactSensorState'];
+  'StatusLowBattery', 'ContactSensorState', 'ConfiguredName'];
 const Characteristic = {
   ChargingState: { NOT_CHARGING: 0, CHARGING: 1 },
   StatusLowBattery: { BATTERY_LEVEL_NORMAL: 0, BATTERY_LEVEL_LOW: 1 },
@@ -29,8 +29,9 @@ for (const n of ['AccessoryInformation', 'Switch', 'Battery', 'ContactSensor']) 
 class FakeService {
   constructor(type, label, sub) {
     this.type = type; this.label = label; this.sub = sub;
-    this.chars = new Map(); this.updates = [];
+    this.chars = new Map(); this.updates = []; this.optional = [];
   }
+  addOptionalCharacteristic(c) { this.optional.push(c); }
   getCharacteristic(c) {
     if (!this.chars.has(c)) {
       const ch = { onGet(fn) { this.get = fn; return this; }, onSet(fn) { this.set = fn; return this; }, value: undefined };
@@ -76,7 +77,7 @@ function makeRobot() {
   r.calls = [];
   r.polls = 0;
   r.poll = async () => { r.polls++; return r.state; };
-  for (const m of ['start', 'pause', 'dock']) r[m] = async () => { r.calls.push(m); };
+  for (const m of ['start', 'pause', 'dock', 'resume']) r[m] = async () => { r.calls.push(m); };
   return r;
 }
 const DEVICE = { deviceId: 'dev1', nickname: 'Vac', product: { sn8: '750Y000G' } };
@@ -186,7 +187,7 @@ test('switch handlers call the matching robot command', async () => {
   await h.svc('pause').getCharacteristic(On).set(true);
   h.robot.state = { status: 'paused', battery: 80, fault: false, at: 1 };
   await h.svc('pause').getCharacteristic(On).set(false);
-  assert.deepEqual(h.robot.calls, ['start', 'dock', 'pause', 'start']);
+  assert.deepEqual(h.robot.calls, ['start', 'dock', 'pause', 'resume']);
   h.stop();
 });
 
@@ -268,21 +269,16 @@ test('an unconfirmed command is not logged again by the platform', async () => {
   h.stop();
 });
 
-test('Pause off resumes only when the robot is paused', async () => {
+test('Pause off only ever calls resume, never start', async () => {
   const h = await boot();
   const set = h.svc('pause').getCharacteristic(Characteristic.On).set;
-  for (const status of ['docked', 'cleaning', 'returning']) {
+  for (const status of ['docked', 'cleaning', 'paused']) {
     h.robot.state = { status, battery: 80, fault: false, at: 1 };
     await set(false);
   }
-  assert.deepEqual(h.robot.calls, []);
-  h.robot.state = { status: 'paused', battery: 80, fault: false, at: 1 };
-  await set(false);
-  assert.deepEqual(h.robot.calls, ['start']);
-  h.robot.calls.length = 0;
   h.robot.fresh = false;
   await set(false);
-  assert.deepEqual(h.robot.calls, []);
+  assert.deepEqual(h.robot.calls, ['resume', 'resume', 'resume', 'resume']);
   h.stop();
 });
 
@@ -416,4 +412,124 @@ test('no log call contains the password or a token', async () => {
   assert.ok(!all.includes(secretPw));
   assert.ok(!all.includes(secretTok));
   api.emit('shutdown');
+});
+
+test('services get short ConfiguredName labels', async () => {
+  const h = await boot();
+  for (const [sub, label] of [['clean', 'Clean'], ['pause', 'Pause'], ['battery', 'Battery'], ['fault', 'Fault']]) {
+    const sv = h.svc(sub);
+    assert.ok(sv.optional.includes(Characteristic.ConfiguredName), `${sub} optional`);
+    assert.equal(sv.getCharacteristic(Characteristic.ConfiguredName).value, label);
+  }
+  h.stop();
+});
+
+test('a missing ConfiguredName characteristic does not throw', async () => {
+  const saved = Characteristic.ConfiguredName;
+  delete Characteristic.ConfiguredName;
+  try {
+    const h = await boot();
+    assert.equal(h.api.registered.length, 1);
+    h.stop();
+  } finally {
+    Characteristic.ConfiguredName = saved;
+  }
+});
+
+test('a throw while binding cached accessories is logged and does not reject', async () => {
+  const acc = new FakeAccessory('Vac', 'uuid:eureka-e20:dev1');
+  const sv = acc.addService(Service.Switch, 'c', 'clean');
+  sv.getCharacteristic = () => { throw new Error('bind boom'); };
+  const h = await boot({ cached: [acc] });
+  assert.ok(h.log.errors.some((m) => m.includes('bind boom')));
+  h.stop();
+});
+
+test('a newly registered accessory is added to the cached list so a retry does not register it twice', async () => {
+  const h = await boot();
+  assert.equal(h.p.cached.length, 1);
+  await h.p.setup();
+  assert.equal(h.api.registered.length, 1);
+  h.stop();
+});
+
+test('a device with neither deviceId nor id logs an error and stops setup', async () => {
+  const h = await boot({ devices: [{ nickname: 'x', product: { sn8: '750Y000G' } }] });
+  assert.equal(h.api.registered.length, 0);
+  assert.equal(h.log.errors.length, 1);
+  assert.equal(h.p.robot, null);
+  h.stop();
+});
+
+test('a device with only id uses it', async () => {
+  const h = await boot({ devices: [{ id: 77, product: { sn8: '750Y000G' } }] });
+  assert.equal(h.api.registered.length, 1);
+  assert.ok(h.acc.UUID.endsWith('77'));
+  h.stop();
+});
+
+async function bootWithTokenFile(content, config) {
+  const api = makeApi();
+  if (content !== undefined) {
+    fs.writeFileSync(path.join(api.user.storagePath(), 'eureka-e20-tokens.json'), JSON.stringify(content));
+  }
+  let opts;
+  const log = makeLog();
+  const p = new EurekaPlatform(log, config || { email: 'a@b.c', password: 'pw' }, api,
+    { makeCloud: (o) => { opts = o; return { getDevices: async () => [DEVICE] }; }, makeRobot: () => makeRobot(), retryMs: 5 });
+  api.emit('didFinishLaunching');
+  await p.ready;
+  return { api, opts, stop: () => api.emit('shutdown') };
+}
+const TOK = { accessToken: 'A', refreshToken: 'R', region: 'eu' };
+
+test('stored tokens for the same email are used', async () => {
+  const h = await bootWithTokenFile({ email: 'a@b.c', tokens: TOK });
+  assert.deepEqual(h.opts.tokens, TOK);
+  h.stop();
+});
+
+test('stored tokens for a different email, or with no email, are ignored', async () => {
+  for (const content of [{ email: 'other@b.c', tokens: TOK }, TOK]) {
+    const h = await bootWithTokenFile(content);
+    assert.equal(h.opts.tokens, null);
+    h.stop();
+  }
+});
+
+test('saved tokens are stored with the email', async () => {
+  const h = await bootWithTokenFile(undefined);
+  h.opts.onTokens(TOK);
+  const saved = JSON.parse(fs.readFileSync(path.join(h.api.user.storagePath(), 'eureka-e20-tokens.json'), 'utf8'));
+  assert.deepEqual(saved, { email: 'a@b.c', tokens: TOK });
+  h.stop();
+});
+
+test('Status check failed warns once, then debug until a check succeeds again', async () => {
+  const h = await boot();
+  let fail = true;
+  h.robot.poll = async () => { if (fail) throw new Error('offline'); return h.robot.state; };
+  const warns = () => h.log.warns.filter((m) => m.includes('Status check failed')).length;
+  const debugs = () => h.log.debugs.filter((m) => m.includes('Status check failed')).length;
+  await h.p.loop(); await h.p.loop(); await h.p.loop();
+  assert.equal(warns(), 1);
+  assert.equal(debugs(), 2);
+  fail = false;
+  await h.p.loop();
+  fail = true;
+  await h.p.loop();
+  assert.equal(warns(), 2);
+  h.stop();
+});
+
+test('a permanently disabled login is logged as one error and not on every poll', async () => {
+  const h = await boot();
+  const err = new AuthError('Correct the email and password in the plugin settings and restart.');
+  err.permanent = true;
+  h.robot.poll = async () => { throw err; };
+  await h.p.loop(); await h.p.loop(); await h.p.loop();
+  assert.equal(h.log.errors.length, 1);
+  assert.match(h.log.errors[0], /email and password/);
+  assert.equal(h.log.warns.filter((m) => m.includes('Status check failed')).length, 0);
+  h.stop();
 });
