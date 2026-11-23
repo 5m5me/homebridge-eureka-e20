@@ -49,7 +49,7 @@ function make(replies, extra = {}) {
 test('poll decodes state and marks the robot reachable', async () => {
   const { cloud, robot } = make([DOCKED], { now: () => 1000 });
   const s = await robot.poll();
-  assert.deepStrictEqual(s, { status: 'docked', battery: 95, fan: 3, water: 0,
+  assert.deepStrictEqual(s, { status: 'docked', workStatus: 6, battery: 95, fan: 3, water: 0,
     fault: false, faultClass: 0, faultCode: 0, at: 1000 });
   assert.strictEqual(robot.reachable, true);
   assert.strictEqual(robot.isFresh(5000), true);
@@ -284,4 +284,58 @@ test('resume when docked, cleaning or idle sends no control frame', async () => 
 test('resume that is not confirmed throws CommandUnconfirmedError', async () => {
   const { robot } = make([withStatus(8), 'ack', withStatus(8), withStatus(8), withStatus(8), withStatus(8)]);
   await assert.rejects(robot.resume(), CommandUnconfirmedError);
+});
+
+// Same docked reply with a different water byte (index 19) and a fixed-up checksum.
+function withWater(w) {
+  const b = Buffer.from(DOCKED, 'hex');
+  b[19] = w; b[b.length - 1] = 0;
+  b[b.length - 1] = (-b.subarray(1).reduce((a, x) => a + x, 0)) & 0xFF;
+  return b.toString('hex');
+}
+
+test('state exposes the raw work status', async () => {
+  const { robot } = make([withStatus(14)]);
+  const s = await robot.poll();
+  assert.strictEqual(s.workStatus, 14);
+});
+
+test('start with a water override from docked sends it with the current suction', async () => {
+  const { cloud, robot } = make([DOCKED, 'ack', withStatus(2)]);
+  await robot.start({ water: 2 });
+  assert.strictEqual(cloud.sent[1], p.startFrame(3, 2));
+});
+
+test('start with water 0 overrides a non-zero reported water', async () => {
+  const { cloud, robot } = make([withWater(3), 'ack', withStatus(2)]);
+  await robot.start({ water: 0 });
+  assert.strictEqual(cloud.sent[1], p.startFrame(3, 0));
+});
+
+test('start ignores an invalid water override and uses the reported water', async () => {
+  for (const water of [7, 1.5, -1, '2', NaN, null]) {
+    const { cloud, robot } = make([withWater(1), 'ack', withStatus(2)]);
+    await robot.start({ water });
+    assert.strictEqual(cloud.sent[1], p.startFrame(3, 1));
+  }
+});
+
+test('start with an empty options object behaves like no argument', async () => {
+  const { cloud, robot } = make([withWater(1), 'ack', withStatus(2)]);
+  await robot.start({});
+  assert.strictEqual(cloud.sent[1], p.startFrame(3, 1));
+});
+
+test('start with a water override while cleaning or moving sends no control frame', async () => {
+  for (const ws of [2, 14]) {
+    const { cloud, robot } = make([withStatus(ws)]);
+    await robot.start({ water: 2 });
+    assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus]);
+  }
+});
+
+test('start with a water override while paused sends only the resume frame', async () => {
+  const { cloud, robot } = make([withStatus(8), 'ack', withStatus(2)]);
+  await robot.start({ water: 2 });
+  assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus, p.FRAMES.resume, p.FRAMES.queryStatus]);
 });
