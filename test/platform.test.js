@@ -57,9 +57,27 @@ function makeApi() {
   api.platformAccessory = FakeAccessory;
   api.registered = [];
   api.registerPlatformAccessories = (plugin, platform, list) => api.registered.push([plugin, platform, list]);
+  api.unregistered = [];
+  api.unregisterPlatformAccessories = (plugin, platform, list) => api.unregistered.push([plugin, platform, list]);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'eureka-test-'));
   api.user = { storagePath: () => dir };
   return api;
+}
+// Fake of api.matter that records every call. Set `failRegister` to make publishing throw.
+function makeMatter(over = {}) {
+  const m = {
+    deviceTypes: { RoboticVacuumCleaner: { name: 'RoboticVacuumCleaner' } },
+    uuid: { generate: (s) => `matter:${s}` },
+    registered: [], updated: [], unregistered: [], states: [], failRegister: false,
+  };
+  m.registerPlatformAccessories = async (plugin, platform, list) => {
+    if (m.failRegister) throw new Error('matter register boom');
+    m.registered.push([plugin, platform, list]);
+  };
+  m.updatePlatformAccessories = async (list) => { m.updated.push(list); };
+  m.unregisterPlatformAccessories = async (plugin, platform, list) => { m.unregistered.push([plugin, platform, list]); };
+  m.updateAccessoryState = async (uuid, cluster, attrs) => { m.states.push([uuid, cluster, attrs]); };
+  return Object.assign(m, over);
 }
 function makeLog() {
   const log = { warns: [], errors: [], debugs: [] };
@@ -83,19 +101,23 @@ function makeRobot() {
 const DEVICE = { deviceId: 'dev1', nickname: 'Vac', product: { sn8: '750Y000G' } };
 
 // Builds a platform, runs setup, returns handles. Always call h.stop().
-async function boot({ config, devices = [DEVICE], robot = makeRobot(), cached = [], waitMs = 50, cloud, extra = {} } = {}) {
+// Stage one tests run with the vacuum tile off. Matter tests pass a config and `matter`.
+async function boot({ config, devices = [DEVICE], robot = makeRobot(), cached = [], cachedMatter = [], matter, waitMs = 50, cloud, extra = {} } = {}) {
   const api = makeApi();
+  if (matter) api.matter = matter;
   const log = makeLog();
   cloud = cloud || { getDevices: async () => devices };
   const deps = { makeCloud: () => cloud, makeRobot: () => robot, commandWaitMs: waitMs, retryMs: 5, ...extra };
-  const p = new EurekaPlatform(log, config || { email: 'a@b.c', password: 'pw' }, api, deps);
+  const p = new EurekaPlatform(log, config || { email: 'a@b.c', password: 'pw', matterVacuum: false }, api, deps);
   for (const a of cached) p.configureAccessory(a);
+  for (const a of cachedMatter) p.configureMatterAccessory(a);
   api.emit('didFinishLaunching');
   await p.ready;
   const acc = p.accessory;
   const svc = (sub) => acc && acc.getServiceById(sub === 'battery' ? Service.Battery : sub === 'fault' ? Service.ContactSensor : Service.Switch, sub);
-  return { api, log, robot, p, acc, svc, stop: () => api.emit('shutdown') };
+  return { api, log, robot, p, acc, svc, matter, stop: () => api.emit('shutdown') };
 }
+const MATTER_CFG = (extra = {}) => ({ email: 'a@b.c', password: 'pw', ...extra });
 const get = (s, c) => s.getCharacteristic(c).get();
 const tick = (ms = 0) => new Promise((r) => setTimeout(r, ms));
 
@@ -531,5 +553,261 @@ test('a permanently disabled login is logged as one error and not on every poll'
   assert.equal(h.log.errors.length, 1);
   assert.match(h.log.errors[0], /email and password/);
   assert.equal(h.log.warns.filter((m) => m.includes('Status check failed')).length, 0);
+  h.stop();
+});
+
+// ---- Matter vacuum tile ----
+test('default config with Matter available publishes the vacuum and no HomeKit accessory', async () => {
+  const matter = makeMatter();
+  const h = await boot({ config: MATTER_CFG(), matter });
+  assert.equal(matter.registered.length, 1);
+  assert.deepEqual(matter.registered[0].slice(0, 2), ['homebridge-eureka-e20', 'EurekaE20']);
+  const acc = matter.registered[0][2][0];
+  assert.equal(acc.UUID, 'matter:eureka-e20-matter:dev1');
+  assert.equal(acc.displayName, 'Vac');
+  assert.equal(h.api.registered.length, 0);
+  assert.ok(!h.acc);
+  assert.equal(h.log.warns.length, 0);
+  h.stop();
+});
+
+test('a cached HomeKit accessory is unregistered when only the vacuum is shown', async () => {
+  const cachedAcc = new FakeAccessory('Vac', 'uuid:eureka-e20:dev1');
+  const h = await boot({ config: MATTER_CFG(), matter: makeMatter(), cached: [cachedAcc] });
+  assert.equal(h.api.unregistered.length, 1);
+  assert.deepEqual(h.api.unregistered[0], ['homebridge-eureka-e20', 'EurekaE20', [cachedAcc]]);
+  assert.equal(h.api.registered.length, 0);
+  assert.ok(!h.p.cached.includes(cachedAcc));
+  h.stop();
+});
+
+test('switches on publishes both the vacuum and the switches', async () => {
+  const matter = makeMatter();
+  const h = await boot({ config: MATTER_CFG({ switches: 'on' }), matter });
+  assert.equal(matter.registered.length, 1);
+  assert.equal(h.api.registered.length, 1);
+  assert.ok(h.svc('clean') && h.svc('pause'));
+  assert.equal(h.api.unregistered.length, 0);
+  h.stop();
+});
+
+test('matterVacuum false creates only the switches and unregisters a cached Matter accessory', async () => {
+  const matter = makeMatter();
+  const old = { UUID: 'matter:old', context: { deviceId: 'dev1' } };
+  const h = await boot({ config: MATTER_CFG({ matterVacuum: false }), matter, cachedMatter: [old] });
+  assert.equal(matter.registered.length, 0);
+  assert.equal(matter.updated.length, 0);
+  assert.deepEqual(matter.unregistered, [['homebridge-eureka-e20', 'EurekaE20', [old]]]);
+  assert.equal(h.api.registered.length, 1);
+  assert.equal(h.log.warns.length, 0);
+  h.stop();
+});
+
+test('an unregister failure for the cached Matter accessory is logged and does not reject', async () => {
+  const matter = makeMatter();
+  matter.unregisterPlatformAccessories = async () => { throw new Error('unreg boom'); };
+  const h = await boot({ config: MATTER_CFG({ matterVacuum: false }), matter, cachedMatter: [{ UUID: 'x', context: {} }] });
+  assert.ok(h.log.warns.some((m) => m.includes('unreg boom')));
+  assert.equal(h.api.registered.length, 1);
+  h.stop();
+});
+
+test('Matter unavailable logs one warning and falls back to the switches', async () => {
+  const noMatter = await boot({ config: MATTER_CFG() });
+  assert.equal(noMatter.log.warns.length, 1);
+  assert.match(noMatter.log.warns[0], /Matter is not enabled for this bridge/);
+  assert.equal(noMatter.api.registered.length, 1);
+  noMatter.stop();
+  const noType = await boot({ config: MATTER_CFG(), matter: makeMatter({ deviceTypes: {} }) });
+  assert.equal(noType.log.warns.length, 1);
+  assert.match(noType.log.warns[0], /Matter is not enabled for this bridge/);
+  assert.equal(noType.api.registered.length, 1);
+  noType.stop();
+  const noMethod = makeMatter();
+  delete noMethod.updateAccessoryState;
+  const nm = await boot({ config: MATTER_CFG(), matter: noMethod });
+  assert.equal(nm.log.warns.length, 1);
+  assert.equal(nm.api.registered.length, 1);
+  nm.stop();
+});
+
+test('the Matter unavailable warning is not repeated when setup is retried', async () => {
+  let n = 0;
+  const cloud = { getDevices: async () => { if (++n < 3) throw new Error('down'); return [DEVICE]; } };
+  const h = await boot({ config: MATTER_CFG(), cloud });
+  await tick(60);
+  assert.equal(h.log.warns.filter((m) => m.includes('Matter is not enabled')).length, 1);
+  h.stop();
+});
+
+test('matterVacuum false with no Matter at all logs no Matter warning', async () => {
+  const h = await boot({ config: MATTER_CFG({ matterVacuum: false }) });
+  assert.equal(h.log.warns.length, 0);
+  h.stop();
+});
+
+test('a publish that throws logs one warning and falls back to the switches', async () => {
+  const matter = makeMatter();
+  matter.failRegister = true;
+  const h = await boot({ config: MATTER_CFG(), matter });
+  assert.equal(h.log.warns.filter((m) => m.includes('matter register boom')).length, 1);
+  assert.equal(h.log.warns.length, 1);
+  assert.equal(h.api.registered.length, 1);
+  assert.ok(h.svc('clean'));
+  // The failed tile does not receive pushes or leave a stale reference.
+  h.robot.emit('state', h.robot.state);
+  assert.equal(matter.states.length, 0);
+  h.stop();
+});
+
+test('switches off with a working tile creates no HomeKit accessory', async () => {
+  const cachedAcc = new FakeAccessory('Vac', 'uuid:eureka-e20:dev1');
+  const h = await boot({ config: MATTER_CFG({ switches: 'off' }), matter: makeMatter(), cached: [cachedAcc] });
+  assert.equal(h.api.registered.length, 0);
+  assert.equal(h.api.unregistered.length, 1);
+  h.stop();
+});
+
+test('switches off without a tile unregisters the cached switches and warns that nothing is shown', async () => {
+  const cachedAcc = new FakeAccessory('Vac', 'uuid:eureka-e20:dev1');
+  const h = await boot({ config: MATTER_CFG({ switches: 'off', matterVacuum: false }), cached: [cachedAcc] });
+  assert.equal(h.api.registered.length, 0);
+  assert.deepEqual(h.api.unregistered, [['homebridge-eureka-e20', 'EurekaE20', [cachedAcc]]]);
+  assert.equal(h.log.warns.length, 1);
+  h.robot.emit('state', h.robot.state); // must not throw without an accessory
+  h.stop();
+});
+
+test('a cached Matter accessory with the same deviceId is passed as cached', async () => {
+  const matter = makeMatter();
+  const cachedMatter = { UUID: 'matter:cached', context: { deviceId: 'dev1', cleanMode: 2 } };
+  const other = { UUID: 'matter:other', context: { deviceId: 'other' } };
+  let opts;
+  const extra = { makeMatterVacuum: (o) => { opts = o; return new (require('../lib/matter-vacuum').MatterVacuum)(o); } };
+  const h = await boot({ config: MATTER_CFG(), matter, cachedMatter: [other, cachedMatter], extra });
+  assert.equal(opts.cached, cachedMatter);
+  assert.equal(matter.registered.length, 0);
+  assert.equal(matter.updated.length, 1);
+  assert.equal(matter.updated[0][0].UUID, 'matter:cached');
+  assert.equal(typeof matter.updated[0][0].handlers.rvcRunMode.changeToMode, 'function');
+  // A cached accessory for a different device is left alone.
+  assert.equal(matter.unregistered.length, 0);
+  h.stop();
+});
+
+test('a robot state event pushes to both accessories when both exist', async () => {
+  const matter = makeMatter();
+  const h = await boot({ config: MATTER_CFG({ switches: 'on' }), matter });
+  const clean = h.svc('clean');
+  const swBefore = clean.updates.length;
+  const stBefore = matter.states.length;
+  h.robot.state = { status: 'cleaning', battery: 50, fault: false, at: 1, water: 0 };
+  h.robot.emit('state', h.robot.state);
+  assert.ok(clean.updates.length > swBefore);
+  assert.ok(matter.states.length > stBefore);
+  assert.ok(matter.states.some(([, c, a]) => c === 'rvcRunMode' && a.currentMode === 1));
+  h.stop();
+});
+
+test('a robot state event pushes to the vacuum alone when there are no switches', async () => {
+  const matter = makeMatter();
+  const h = await boot({ config: MATTER_CFG(), matter });
+  const before = matter.states.length;
+  h.robot.state = { status: 'paused', battery: 50, fault: false, at: 1, water: 0 };
+  h.robot.emit('state', h.robot.state);
+  assert.ok(matter.states.length > before);
+  h.robot.fresh = false;
+  h.robot.emit('state', h.robot.state);
+  assert.ok(matter.states.some(([, c, a]) => c === 'rvcOperationalState' && a.operationalState === 3));
+  h.stop();
+});
+
+test('a Matter handler failure rejects the handler, warns and causes no unhandled rejection', async () => {
+  const rejections = [];
+  const onRej = (e) => rejections.push(e);
+  process.on('unhandledRejection', onRej);
+  try {
+    const matter = makeMatter();
+    const h = await boot({ config: MATTER_CFG(), matter });
+    h.robot.start = async () => { throw new Error('matter start failed'); };
+    const handlers = matter.registered[0][2][0].handlers;
+    await assert.rejects(handlers.rvcRunMode.changeToMode({ newMode: 1 }),
+      (e) => e instanceof Error && !(e instanceof HapStatusError) && /matter start failed/.test(e.message));
+    assert.equal(h.log.warns.filter((m) => m.includes('matter start failed')).length, 1);
+    // A slow command that fails after the wait is handled in the background.
+    const slow = await boot({ config: MATTER_CFG(), matter: makeMatter(), waitMs: 10 });
+    let fail;
+    slow.robot.dock = () => new Promise((_, rej) => { fail = rej; });
+    await slow.matter.registered[0][2][0].handlers.rvcOperationalState.goHome();
+    fail(new Error('late matter failure'));
+    await tick(20);
+    assert.equal(slow.log.warns.filter((m) => m.includes('late matter failure')).length, 1);
+    assert.deepEqual(rejections, []);
+    h.stop(); slow.stop();
+  } finally {
+    process.off('unhandledRejection', onRej);
+  }
+});
+
+test('a Matter command does the same bounded wait, fast poll and push as a switch', async () => {
+  const matter = makeMatter();
+  const h = await boot({ config: MATTER_CFG(), matter });
+  const handlers = matter.registered[0][2][0].handlers;
+  await handlers.rvcOperationalState.pause();
+  await handlers.rvcOperationalState.resume();
+  await handlers.rvcOperationalState.goHome();
+  await handlers.rvcRunMode.changeToMode({ newMode: 1 });
+  assert.deepEqual(h.robot.calls, ['pause', 'resume', 'dock', 'start']);
+  assert.ok(h.p.fastUntil > 0);
+  h.stop();
+});
+
+test('options are passed through to MatterVacuum', async () => {
+  const seen = [];
+  const extra = { makeMatterVacuum: (o) => { seen.push(o); return { publish: async () => {}, push() {}, accessory: {} }; } };
+  const run = async (config) => {
+    const h = await boot({ config: MATTER_CFG(config), matter: makeMatter(), extra });
+    h.stop();
+    return seen.at(-1);
+  };
+  let o = await run({});
+  assert.equal(o.cleanModes, true);
+  assert.equal(o.mopWater, 2);
+  assert.equal(o.deviceId, 'dev1');
+  assert.equal(o.name, 'Vac');
+  assert.equal(o.pluginName, 'homebridge-eureka-e20');
+  assert.equal(o.platformName, 'EurekaE20');
+  assert.equal(typeof o.run, 'function');
+  assert.equal(typeof o.maxAgeMs, 'function');
+  assert.equal(o.maxAgeMs(), (30 * 3 + 20) * 1000);
+  assert.equal(o.cached, undefined);
+  o = await run({ cleanModes: false, mopWater: 3, pollSeconds: 60 });
+  assert.equal(o.cleanModes, false);
+  assert.equal(o.mopWater, 3);
+  assert.equal(o.maxAgeMs(), (60 * 3 + 20) * 1000);
+  o = await run({ mopWater: 1 });
+  assert.equal(o.mopWater, 1);
+  for (const bad of [0, 4, 7, -1, 1.5, '2', null, NaN]) {
+    o = await run({ mopWater: bad });
+    assert.equal(o.mopWater, 2, `mopWater ${String(bad)}`);
+  }
+});
+
+test('the run function given to MatterVacuum throws a plain Error on a quick failure', async () => {
+  const seen = [];
+  const extra = { makeMatterVacuum: (o) => { seen.push(o); return { publish: async () => {}, push() {}, accessory: {} }; } };
+  const h = await boot({ config: MATTER_CFG(), matter: makeMatter(), extra });
+  const { run } = seen[0];
+  await assert.rejects(run(async () => { throw new Error('quick'); }),
+    (e) => e instanceof Error && !(e instanceof HapStatusError) && e.message === 'quick');
+  assert.equal(await run(async () => 'x'), undefined);
+  h.stop();
+});
+
+test('setting up twice does not publish the vacuum twice', async () => {
+  const matter = makeMatter();
+  const h = await boot({ config: MATTER_CFG(), matter });
+  await h.p.setup();
+  assert.equal(matter.registered.length, 1);
   h.stop();
 });
