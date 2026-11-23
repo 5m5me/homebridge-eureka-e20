@@ -5,6 +5,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { EventEmitter } = require('node:events');
+const { setImmediate } = require('node:timers/promises');
 const { EurekaPlatform } = require('../lib/platform');
 const { AuthError } = require('../lib/cloud');
 const { CommandUnconfirmedError } = require('../lib/robot');
@@ -686,10 +687,11 @@ test('a cached Matter accessory with the same deviceId is passed as cached', asy
   const extra = { makeMatterVacuum: (o) => { opts = o; return new (require('../lib/matter-vacuum').MatterVacuum)(o); } };
   const h = await boot({ config: MATTER_CFG(), matter, cachedMatter: [other, cachedMatter], extra });
   assert.equal(opts.cached, cachedMatter);
-  assert.equal(matter.registered.length, 0);
-  assert.equal(matter.updated.length, 1);
-  assert.equal(matter.updated[0][0].UUID, 'matter:cached');
-  assert.equal(typeof matter.updated[0][0].handlers.rvcRunMode.changeToMode, 'function');
+  assert.equal(matter.registered.length, 1);
+  assert.equal(matter.updated.length, 0);
+  assert.equal(matter.registered[0][2][0], cachedMatter);
+  assert.equal(matter.registered[0][2][0].UUID, 'matter:cached');
+  assert.equal(typeof matter.registered[0][2][0].handlers.rvcRunMode.changeToMode, 'function');
   // A cached accessory for a different device is left alone.
   assert.equal(matter.unregistered.length, 0);
   h.stop();
@@ -703,6 +705,7 @@ test('a robot state event pushes to both accessories when both exist', async () 
   const stBefore = matter.states.length;
   h.robot.state = { status: 'cleaning', battery: 50, fault: false, at: 1, water: 0 };
   h.robot.emit('state', h.robot.state);
+  await setImmediate();
   assert.ok(clean.updates.length > swBefore);
   assert.ok(matter.states.length > stBefore);
   assert.ok(matter.states.some(([, c, a]) => c === 'rvcRunMode' && a.currentMode === 1));
@@ -715,9 +718,11 @@ test('a robot state event pushes to the vacuum alone when there are no switches'
   const before = matter.states.length;
   h.robot.state = { status: 'paused', battery: 50, fault: false, at: 1, water: 0 };
   h.robot.emit('state', h.robot.state);
+  await setImmediate();
   assert.ok(matter.states.length > before);
   h.robot.fresh = false;
   h.robot.emit('state', h.robot.state);
+  await setImmediate();
   assert.ok(matter.states.some(([, c, a]) => c === 'rvcOperationalState' && a.operationalState === 3));
   h.stop();
 });
@@ -809,5 +814,16 @@ test('setting up twice does not publish the vacuum twice', async () => {
   const h = await boot({ config: MATTER_CFG(), matter });
   await h.p.setup();
   assert.equal(matter.registered.length, 1);
+  h.stop();
+});
+
+test('a restored tile whose register fails is unregistered and the switches are used', async () => {
+  const matter = makeMatter();
+  matter.failRegister = true;
+  const cachedMatter = { UUID: 'matter:cached', context: { deviceId: 'dev1' } };
+  const h = await boot({ config: MATTER_CFG(), matter, cachedMatter: [cachedMatter] });
+  assert.deepEqual(matter.unregistered, [['homebridge-eureka-e20', 'EurekaE20', [cachedMatter]]]);
+  assert.equal(h.api.registered.length, 1);
+  assert.equal(h.log.warns.length, 1);
   h.stop();
 });
