@@ -10,11 +10,22 @@ the mop water level set in the options. The switches are a Clean switch (on star
 switch, battery level and charging state, and a Fault sensor that opens when the robot
 reports a problem.
 
-Vacuum tile: Homebridge publishes a Matter robot vacuum on its own dedicated Matter
-bridge, so it has its own pairing code, separate from the main Homebridge pairing. Add it
-in the Home app with that code. It needs Matter enabled in Homebridge and iOS 18.4 or
-later. If Matter is not enabled for this bridge, the plugin logs one warning and shows the
-Clean and Pause switches instead, so it still works.
+Vacuum tile: Homebridge publishes the Matter robot vacuum on its own Matter server, so the
+tile is paired separately, with its own code, not with the main Homebridge pairing. Add it
+in the Home app with that code. It needs Matter switched on for this plugin's child bridge
+and iOS 18.4 or later. If Matter is not enabled for this bridge, or the tile fails to
+publish, the plugin logs a warning and shows the Clean and Pause switches instead, so it
+still works.
+
+Things to know about the vacuum tile:
+- If you turn matterVacuum off, the old tile stays in Apple Home showing No Response until
+  you remove it in the Home app.
+- Stop or Idle from Home sends the robot to the dock.
+- Starting while the robot is paused resumes the clean with the robot's existing mop water,
+  not the selected mode.
+- The selected clean mode is kept in memory only, so it goes back to Vacuum after a restart.
+- Vacuum and mop is not yet proven on a real robot. The plugin warns in the log if the robot
+  reports a different mop water level than the one it was sent.
 
 Options:
 - Show as a vacuum in Apple Home (matterVacuum, default on).

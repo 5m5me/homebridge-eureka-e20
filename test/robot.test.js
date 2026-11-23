@@ -339,3 +339,34 @@ test('start with a water override while paused sends only the resume frame', asy
   await robot.start({ water: 2 });
   assert.deepStrictEqual(cloud.sent, [p.FRAMES.queryStatus, p.FRAMES.resume, p.FRAMES.queryStatus]);
 });
+
+function withReportedWater(ws, water) {
+  const b = Buffer.from(withStatus(ws), 'hex');
+  b[19] = water; b[b.length - 1] = 0;
+  b[b.length - 1] = (-b.subarray(1).reduce((a, x) => a + x, 0)) & 0xFF;
+  return b.toString('hex');
+}
+
+test('a confirmed start with an explicit water value that the robot does not report logs one warning naming both', async () => {
+  const warn = [];
+  const log = { debug() {}, warn: (m) => warn.push(m) };
+  const { robot } = make([DOCKED, 'ack', withReportedWater(2, 0)], { log });
+  await robot.start({ water: 2 });
+  assert.strictEqual(warn.length, 1);
+  assert.match(warn[0], /mop water 0/);
+  assert.match(warn[0], /2 was sent/);
+});
+
+test('no water warning when the reported water matches, when none was sent, or when nothing was started', async () => {
+  const warn = [];
+  const log = { debug() {}, warn: (m) => warn.push(m) };
+  let t = make([DOCKED, 'ack', withReportedWater(2, 2)], { log });
+  await t.robot.start({ water: 2 });
+  t = make([DOCKED, 'ack', withReportedWater(2, 1)], { log });
+  await t.robot.start();
+  t = make([withReportedWater(2, 1)], { log });
+  await t.robot.start({ water: 3 }); // already cleaning, nothing sent
+  t = make([withStatus(8), 'ack', withReportedWater(2, 1)], { log });
+  await t.robot.start({ water: 3 }); // resume, nothing about water sent
+  assert.deepStrictEqual(warn, []);
+});
