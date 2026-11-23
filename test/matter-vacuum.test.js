@@ -80,18 +80,97 @@ test('publish registers one accessory with the right fields', async () => {
   assert.deepEqual(Object.keys(a.handlers), ['rvcRunMode', 'rvcOperationalState', 'rvcCleanMode']);
 });
 
-test('publish with cached updates instead of registering and keeps UUID and clean mode', async () => {
+const flush = () => new Promise((r) => setImmediate(r));
+
+test('publish with cached still registers, keeps UUID and clean mode, and pushes every cluster after register', async () => {
   const cached = { UUID: 'cached-uuid', context: { deviceId: 'dev1', cleanMode: 2, extra: 'x' }, clusters: { old: 1 }, handlers: {} };
   const t = make({ ctor: { cached } });
-  await t.vac.publish();
-  assert.equal(t.calls.register.length, 0);
-  assert.equal(t.calls.update.length, 1);
-  assert.deepEqual(t.calls.update[0], [[t.vac.accessory]]);
+  let release;
+  t.matter.registerPlatformAccessories = (...a) => {
+    t.calls.register.push(a);
+    return new Promise((r) => { release = r; });
+  };
+  const p = t.vac.publish();
+  await flush();
+  assert.equal(t.calls.register.length, 1);
+  assert.equal(t.calls.state.length, 0, 'nothing pushed before register resolves');
+  release();
+  await p;
+  await flush();
+  assert.deepEqual(t.calls.register[0], ['homebridge-eureka-e20', 'EurekaE20', [t.vac.accessory]]);
+  assert.equal(t.calls.update.length, 0);
   assert.equal(t.vac.accessory.UUID, 'cached-uuid');
   assert.equal(t.vac.accessory.context.cleanMode, 2);
+  assert.equal(t.vac.accessory.context.extra, 'x');
   assert.equal(t.vac.accessory.clusters.rvcCleanMode.currentMode, 2);
   assert.equal(t.vac.accessory.clusters.old, undefined);
   assert.equal(typeof t.vac.accessory.handlers.rvcRunMode.changeToMode, 'function');
+  assert.deepEqual(t.calls.state.map((c) => c[1]).sort(),
+    ['powerSource', 'rvcCleanMode', 'rvcOperationalState', 'rvcRunMode']);
+  assert.ok(t.calls.state.every((c) => c[0] === 'cached-uuid'));
+});
+
+test('a change while register is pending is pushed after publish for a new accessory', async () => {
+  const t = make();
+  let release;
+  t.matter.registerPlatformAccessories = (...a) => {
+    t.calls.register.push(a);
+    return new Promise((r) => { release = r; });
+  };
+  const p = t.vac.publish();
+  await flush();
+  t.robot.fresh = false;
+  t.vac.push();
+  await flush();
+  assert.equal(t.calls.state.length, 0);
+  release();
+  await p;
+  await flush();
+  assert.deepEqual(t.calls.state.map((c) => c[1]).sort(), ['powerSource', 'rvcOperationalState']);
+});
+
+test('clean mode change before publish completes is kept in context and persisted after', async () => {
+  const t = make();
+  let release;
+  t.matter.registerPlatformAccessories = (...a) => {
+    t.calls.register.push(a);
+    return new Promise((r) => { release = r; });
+  };
+  const p = t.vac.publish();
+  await flush();
+  await t.vac.accessory.handlers.rvcCleanMode.changeToMode({ newMode: 2 });
+  assert.equal(t.vac.accessory.context.cleanMode, 2);
+  assert.equal(t.calls.update.length, 0, 'not persisted while unregistered');
+  release();
+  await p;
+  await flush();
+  assert.equal(t.calls.update.length, 1);
+  assert.equal(t.vac.accessory.context.cleanMode, 2);
+});
+
+test('updates for one cluster stay in order even when an earlier one is slow', async () => {
+  const t = make();
+  await t.vac.publish();
+  const started = [];
+  const releases = [];
+  t.matter.updateAccessoryState = (uuid, name, attrs) => {
+    started.push([name, attrs.operationalState]);
+    return new Promise((r) => releases.push(r));
+  };
+  t.robot.fresh = false;
+  t.vac.push();
+  await flush();
+  t.robot.fresh = true;
+  t.robot.state = { status: 'cleaning', workStatus: 3, battery: 95, water: 0, fault: false, at: 2 };
+  t.vac.push();
+  await flush();
+  const op = () => started.filter((s) => s[0] === 'rvcOperationalState');
+  assert.deepEqual(op(), [['rvcOperationalState', 3]], 'second update waits for the first');
+  releases.splice(0).forEach((r) => r());
+  await flush();
+  releases.splice(0).forEach((r) => r());
+  await flush();
+  assert.deepEqual(op(), [['rvcOperationalState', 3], ['rvcOperationalState', 1]]);
 });
 
 test('cached clean mode other than 0 or 2 falls back to Vacuum', async () => {
@@ -164,6 +243,7 @@ test('clean mode change sends nothing to the robot, persists, and pushes', async
   await t.vac.publish();
   t.calls.update.length = 0;
   await t.vac.accessory.handlers.rvcCleanMode.changeToMode({ newMode: 2 });
+  await flush();
   assert.equal(t.robotCalls.length, 0);
   assert.equal(t.runCalls.length, 0);
   assert.equal(t.vac.accessory.context.cleanMode, 2);
@@ -195,6 +275,7 @@ test('a failing run rejects the handler and still pushes', async () => {
   await t.vac.publish();
   t.robot.state = { status: 'cleaning', workStatus: 3, battery: 80, water: 0, fault: false, at: 2 };
   await assert.rejects(t.vac.accessory.handlers.rvcOperationalState.pause(), /no answer/);
+  await flush();
   assert.ok(t.calls.state.some((c) => c[1] === 'rvcRunMode'));
 });
 
@@ -202,6 +283,7 @@ test('push sends only changed clusters, nothing when unchanged', async () => {
   const t = make();
   await t.vac.publish();
   t.vac.push();
+  await flush();
   assert.equal(t.calls.state.length, 0);
   t.robot.state = { status: 'cleaning', workStatus: 3, battery: 95, water: 0, fault: false, at: 2 };
   t.vac.push();
@@ -218,6 +300,7 @@ test('unreachable robot is pushed as error, not a stale healthy state', async ()
   await t.vac.publish();
   t.robot.fresh = false;
   t.vac.push();
+  await flush();
   const op = t.calls.state.find((c) => c[1] === 'rvcOperationalState');
   assert.equal(op[2].operationalState, 3);
   const ps = t.calls.state.find((c) => c[1] === 'powerSource');
@@ -240,6 +323,7 @@ test('push swallows a rejected or throwing update, logs at debug, and retries la
   mode = 'ok';
   calls.state.length = 0;
   t.vac.push();
+  await flush();
   assert.ok(calls.state.length > 0, 'failed clusters are sent again');
   matter.updateAccessoryState = () => { throw new Error('sync'); };
   t.robot.fresh = true;
